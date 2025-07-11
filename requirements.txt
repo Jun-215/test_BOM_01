@@ -1,0 +1,12 @@
+# 核心依赖
+requests>=2.28.0
+python-dotenv>=0.19.0
+pyppeteer>=1.0.2
+
+# 可选依赖（用于更好的浏览器控制）
+asyncio-throttle>=1.0.2
+websockets>=10.0
+
+# 开发依赖
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
