@@ -42,51 +42,124 @@ class BrowserController:
                 "https://www.douban.com": "input[type='submit']"
             }
     
-    async def launch_browser(self):
-        """启动浏览器"""
+    async def launch_browser(self, retry_count=3):
+        """启动浏览器（带重试机制）"""
         if self._browser is not None:
             print("浏览器已经在运行中")
             return
-            
-        try:
-            self._browser = await launch(
-                headless=BROWSER_HEADLESS,
-                executablePath=CHROME_PATH,
-                args=[
-                    "--start-maximized",
+        
+        # 测试不同的配置
+        configs = [
+            {
+                "name": "最小配置",
+                "args": ["--no-sandbox"]
+            },
+            {
+                "name": "标准配置", 
+                "args": [
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage"
+                ]
+            },
+            {
+                "name": "完整配置",
+                "args": [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox", 
                     "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--disable-gpu",
+                    "--disable-web-security",
+                    "--disable-features=VizDisplayCompositor",
                     "--window-size=1920,1080"
-                ],
-                timeout=BROWSER_TIMEOUT
-            )
-            self._page = await self._browser.newPage()
-            await self._page.setViewport({'width': 1920, 'height': 1080})
-            print("浏览器启动成功")
-        except Exception as e:
-            print(f"浏览器启动失败: {e}")
-            raise
+                ]
+            }
+        ]
+        
+        for config in configs:
+            for attempt in range(retry_count):
+                try:
+                    print(f"🚀 [尝试] {config['name']} - 第{attempt+1}次尝试...")
+                    
+                    self._browser = await launch(
+                        headless=BROWSER_HEADLESS,
+                        executablePath=CHROME_PATH,
+                        args=config["args"],
+                        timeout=30000
+                    )
+                    
+                    # 测试浏览器是否真的可用
+                    self._page = await self._browser.newPage()
+                    await self._page.setViewport({'width': 1920, 'height': 1080})
+                    
+                    # 简单测试页面导航
+                    await self._page.goto("about:blank", {'timeout': 5000})
+                    
+                    print(f"✅ [成功] 浏览器启动成功 - {config['name']}")
+                    return
+                    
+                except Exception as e:
+                    print(f"❌ [失败] {config['name']} 第{attempt+1}次尝试失败: {e}")
+                    
+                    # 清理失败的浏览器实例
+                    if self._browser:
+                        try:
+                            await self._browser.close()
+                        except:
+                            pass
+                        self._browser = None
+                        self._page = None
+                    
+                    if attempt < retry_count - 1:
+                        print(f"⏳ [等待] 等待2秒后重试...")
+                        await asyncio.sleep(2)
+        
+        # 所有配置都失败
+        raise Exception("所有浏览器配置都启动失败，请运行 browser_diagnostic.py 进行详细诊断")
+    
+    async def is_browser_alive(self):
+        """检查浏览器是否仍然活跃"""
+        if not self._browser or not self._page:
+            return False
+        
+        try:
+            # 尝试获取页面标题，如果连接断开会抛出异常
+            await self._page.title()
+            return True
+        except Exception:
+            return False
+    
+    async def ensure_browser_ready(self):
+        """确保浏览器处于可用状态"""
+        if not await self.is_browser_alive():
+            print("🔧 [检测] 浏览器连接已断开，正在重新启动...")
+            # 清理旧的浏览器实例
+            self._browser = None
+            self._page = None
+            # 重新启动浏览器
+            await self.launch_browser()
+        else:
+            print("✅ [检测] 浏览器连接正常")
     
     async def close_browser(self):
         """关闭浏览器"""
         if self._browser:
-            await self._browser.close()
-            self._browser = None
-            self._page = None
-            print("浏览器已关闭")
+            try:
+                await self._browser.close()
+            except Exception as e:
+                print(f"关闭浏览器时出错: {e}")
+            finally:
+                self._browser = None
+                self._page = None
+                print("浏览器已关闭")
     
     async def goto_website(self, url: str):
         """导航到指定网站"""
-        if not self._page:
-            print("🔧 浏览器未启动，正在启动...")
-            await self.launch_browser()
+        # 确保浏览器处于可用状态
+        await self.ensure_browser_ready()
         
         try:
             print(f"🌐 [步骤1] 正在导航到: {url}")
-            await self._page.goto(url, {'waitUntil': 'networkidle2', 'timeout': BROWSER_TIMEOUT})
+            await self._page.goto(url, {'waitUntil': 'domcontentloaded', 'timeout': 60000})
             
             # 获取页面信息
             page_title = await self._page.title()
@@ -104,12 +177,29 @@ class BrowserController:
             print(f"✅ [步骤3] 网站打开成功: {url}")
         except Exception as e:
             print(f"❌ 打开网站失败: {e}")
+            # 如果是连接错误，尝试重新启动浏览器后重试一次
+            if "Target closed" in str(e) or "Protocol error" in str(e):
+                print("🔄 [重试] 检测到连接错误，重新启动浏览器后重试...")
+                self._browser = None
+                self._page = None
+                await self.ensure_browser_ready()
+                try:
+                    await self._page.goto(url, {'waitUntil': 'domcontentloaded', 'timeout': 60000})
+                    page_title = await self._page.title()
+                    current_url = self._page.url
+                    print(f"📄 [页面信息] 标题: {page_title}")
+                    print(f"📄 [页面信息] 当前URL: {current_url}")
+                    print(f"✅ [步骤3] 网站打开成功: {url}")
+                    return
+                except Exception as retry_e:
+                    print(f"❌ 重试后仍然失败: {retry_e}")
+                    raise retry_e
             raise
     
     async def find_element_with_debug(self, selectors: list, element_type: str, timeout: int = 10000):
         """带调试信息的元素查找"""
         print(f"🔍 [思考] 正在查找{element_type}...")
-        print(f"🧠 [策略] 将尝试以下选择器: {selectors}")
+        print(f"🧠 [策略] 将尝试以下选择器: {selectors[:3]}..." if len(selectors) > 3 else f"🧠 [策略] 将尝试以下选择器: {selectors}")
         
         for i, selector in enumerate(selectors, 1):
             try:
@@ -118,13 +208,77 @@ class BrowserController:
                 print(f"✅ [成功] 找到{element_type}: {selector}")
                 return selector
             except Exception as e:
-                print(f"⚠️  [失败] 选择器 {selector} 未找到元素: {str(e)[:50]}...")
+                print(f"⚠️  [失败] 选择器 {selector} 未找到元素")
                 continue
         
-        # 如果所有选择器都失败，输出页面调试信息
+        # 如果所有选择器都失败，进行智能分析
         print(f"❌ [失败] 所有选择器都未找到{element_type}")
-        await self.debug_page_elements()
+        
+        # 针对密码框的特殊处理
+        if "密码" in element_type:
+            await self.analyze_login_form()
+        else:
+            await self.debug_page_elements()
+        
         raise Exception(f"找不到{element_type}")
+    
+    async def analyze_login_form(self):
+        """分析登录表单结构"""
+        print("🔍 [深度分析] 分析登录表单结构...")
+        try:
+            # 检查是否有多个登录Tab
+            tabs_info = await self._page.evaluate('''
+                () => {
+                    const tabs = Array.from(document.querySelectorAll('div, span, a, button')).filter(el => 
+                        el.textContent && (
+                            el.textContent.includes('密码') || 
+                            el.textContent.includes('验证码') ||
+                            el.textContent.includes('短信') ||
+                            el.textContent.includes('Password') ||
+                            el.textContent.includes('SMS')
+                        )
+                    );
+                    return tabs.map(tab => ({
+                        text: tab.textContent.trim(),
+                        tagName: tab.tagName,
+                        className: tab.className,
+                        id: tab.id
+                    }));
+                }
+            ''')
+            
+            if tabs_info:
+                print(f"📊 [分析] 找到登录选项卡: {len(tabs_info)} 个")
+                for i, tab in enumerate(tabs_info[:3]):
+                    print(f"   {i+1}. {tab['text']} ({tab['tagName']}.{tab['className']})")
+                
+                # 尝试点击密码相关的tab
+                password_tabs = [tab for tab in tabs_info if '密码' in tab['text'] or 'Password' in tab['text']]
+                if password_tabs:
+                    print(f"🔄 [尝试] 点击密码登录选项卡: {password_tabs[0]['text']}")
+                    await self._page.evaluate(f'''
+                        () => {{
+                            const tabs = Array.from(document.querySelectorAll('div, span, a, button'));
+                            const target = tabs.find(el => el.textContent && el.textContent.includes('{password_tabs[0]['text']}'));
+                            if (target) target.click();
+                        }}
+                    ''')
+                    await asyncio.sleep(2)
+                    
+                    # 再次检查密码框
+                    try:
+                        await self._page.waitForSelector("input[type='password']", {'timeout': 3000})
+                        print("✅ [成功] 切换后找到密码框")
+                        return
+                    except:
+                        print("❌ [失败] 切换后仍未找到密码框")
+            
+            # 输出所有input元素进行分析
+            await self.debug_page_elements()
+            
+        except Exception as e:
+            print(f"⚠️  [分析失败] 登录表单分析出错: {e}")
+            await self.debug_page_elements()
     
     async def debug_page_elements(self):
         """输出页面调试信息"""
@@ -170,6 +324,8 @@ class BrowserController:
     async def search_in_website(self, url: str, search_query: str):
         """在指定网站中搜索内容"""
         try:
+            # 确保浏览器连接正常
+            await self.ensure_browser_ready()
             print(f"🔍 [搜索任务] 开始在网站搜索: {search_query}")
             
             # 获取搜索框选择器
@@ -231,23 +387,120 @@ class BrowserController:
             print(f"❌ [错误] 搜索失败: {e}")
             raise
     
+    async def detect_login_mode(self):
+        """检测当前登录模式并切换到密码登录"""
+        print("🔍 [分析] 检测登录页面模式...")
+        
+        # 检查是否有模式切换按钮
+        mode_switch_selectors = [
+            # 常见的切换到密码登录的按钮
+            "button:contains('密码登录')",
+            "a:contains('密码登录')", 
+            "span:contains('密码登录')",
+            "div:contains('密码登录')",
+            "[data-testid*='password']",
+            ".password-login",
+            ".pwd-login",
+            "#password-login",
+            "button:contains('账号密码登录')",
+            "a:contains('账号密码登录')",
+            # 英文版本
+            "button:contains('Password')",
+            "a:contains('Password')",
+            "button:contains('Sign in with password')",
+            # 通用切换按钮
+            ".tab:contains('密码')",
+            ".switch-mode",
+            ".login-tab:contains('密码')"
+        ]
+        
+        # 检查当前是否已经在密码登录模式
+        password_input_exists = False
+        try:
+            await self._page.waitForSelector("input[type='password']", {'timeout': 2000})
+            password_input_exists = True
+            print("✅ [检测] 当前已经是密码登录模式")
+        except:
+            print("⚠️  [检测] 当前不是密码登录模式，尝试切换...")
+        
+        if not password_input_exists:
+            # 尝试点击切换按钮
+            for selector in mode_switch_selectors:
+                try:
+                    print(f"🔄 [尝试] 查找切换按钮: {selector}")
+                    # 使用JavaScript查找包含文本的元素
+                    if "contains" in selector:
+                        text = selector.split("'")[1]
+                        element_type = selector.split(":")[0]
+                        elements = await self._page.evaluate(f'''
+                            () => {{
+                                const elements = Array.from(document.querySelectorAll('{element_type}'));
+                                return elements.filter(el => el.textContent.includes('{text}'));
+                            }}
+                        ''')
+                        if elements:
+                            await self._page.evaluate(f'''
+                                () => {{
+                                    const elements = Array.from(document.querySelectorAll('{element_type}'));
+                                    const target = elements.find(el => el.textContent.includes('{text}'));
+                                    if (target) target.click();
+                                }}
+                            ''')
+                            print(f"✅ [成功] 点击切换按钮: {text}")
+                            await asyncio.sleep(2)  # 等待页面更新
+                            break
+                    else:
+                        await self._page.waitForSelector(selector, {'timeout': 1000})
+                        await self._page.click(selector)
+                        print(f"✅ [成功] 点击切换按钮: {selector}")
+                        await asyncio.sleep(2)  # 等待页面更新
+                        break
+                except Exception as e:
+                    print(f"❌ [失败] 切换按钮未找到: {selector}")
+                    continue
+            
+            # 再次检查是否成功切换到密码模式
+            try:
+                await self._page.waitForSelector("input[type='password']", {'timeout': 3000})
+                print("✅ [成功] 已切换到密码登录模式")
+            except:
+                print("⚠️  [警告] 未能切换到密码模式，将尝试通用登录策略")
+    
     async def login_to_website(self, username: str, password: str):
         """登录网站"""
         try:
+            # 确保浏览器连接正常
+            await self.ensure_browser_ready()
             print(f"🔐 [登录任务] 开始登录，用户名: {username}")
             
-            # 通用登录选择器
+            # 首先检测并切换登录模式
+            await self.detect_login_mode()
+            
+            # 扩展的用户名选择器（包括手机号、邮箱等）
             username_selectors = [
                 "input[name='username']",
                 "input[name='user']", 
                 "input[name='email']",
+                "input[name='phone']",
+                "input[name='mobile']",
+                "input[name='account']",
                 "input[id='username']",
                 "input[id='user']",
+                "input[id='phone']",
+                "input[id='mobile']",
+                "input[id='account']",
                 "input[placeholder*='用户名']",
                 "input[placeholder*='用户']",
+                "input[placeholder*='手机号']",
+                "input[placeholder*='邮箱']",
+                "input[placeholder*='账号']",
                 "input[placeholder*='username']",
                 "input[placeholder*='Username']",
-                "input[type='text']"
+                "input[placeholder*='phone']",
+                "input[placeholder*='email']",
+                "input[type='text']",
+                "input[type='tel']",
+                "input[type='email']"
             ]
             
             password_selectors = [
@@ -375,9 +628,9 @@ class BrowserController:
             if not website_url:
                 raise ValueError("缺少必要的参数: website_url")
             
-            # 启动浏览器
+            # 确保浏览器处于可用状态
             print("🚀 [初始化] 准备浏览器...")
-            await self.launch_browser()
+            await self.ensure_browser_ready()
             
             # 打开网站
             await self.goto_website(website_url)
